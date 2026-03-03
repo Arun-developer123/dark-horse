@@ -1,0 +1,26 @@
+version: "3.8"
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+  darkhorse:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      - DATABASE_URL=sqlite:///db.sqlite
+      - REDIS_URL=redis://redis:6379/0
+      - ADMIN_TOKEN=change_this_to_secure_value
+    volumes:
+      - ./uploads:/app/uploads
+      - ./db.sqlite:/app/db.sqlite
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+volumes:
+  redis-data:

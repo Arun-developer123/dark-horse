@@ -1,0 +1,13 @@
+flask
+pillow
+numpy
+opencv-python-headless
+scipy
+piexif
+gunicorn
+flask-limiter
+redis
+python-dotenv
+sqlalchemy
+flask_sqlalchemy
+flask-talisman
