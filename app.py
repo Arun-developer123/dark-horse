@@ -1,4 +1,4 @@
-# app.py -- Dark Horse Image Truth Engine (final UI + layered analysis, render-friendly)
+# app.py -- Dark Horse Image Truth Engine (light, colorful UI)
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -110,10 +110,12 @@ def extract_exif(pil_img):
     except Exception:
         return {}
 
+
 def pil_to_cv2(pil_img):
     arr = np.array(pil_img.convert('RGB'))
     # Return BGR (cv2 default)
     return arr[:, :, ::-1].copy()
+
 
 def clamp01(x):
     return max(0.0, min(1.0, float(x)))
@@ -129,6 +131,7 @@ def sensor_noise_score(cv2_gray):
     score = (std - 0.002) / (0.04 - 0.002)
     return clamp01(score), std
 
+
 def smoothness_score(cv2_gray):
     img = cv2_gray.astype(np.float32) / 255.0
     mean = cv2.blur(img, (3,3))
@@ -137,6 +140,7 @@ def smoothness_score(cv2_gray):
     mean_var = float(np.mean(var))
     score = (mean_var - 1e-6) / (0.005 - 1e-6)
     return clamp01(score), mean_var
+
 
 def frequency_kurtosis_score(cv2_gray):
     img = cv2_gray.astype(np.float32)
@@ -163,6 +167,7 @@ def frequency_kurtosis_score(cv2_gray):
     else:
         score = 0.25
     return clamp01(score), k
+
 
 def artifact_penalty(cv2_bgr):
     img = cv2_bgr.astype(np.float32) / 255.0
@@ -192,6 +197,7 @@ def artifact_penalty(cv2_bgr):
     penalty = float(np.clip(penalty, 0.0, 1.0))
     return penalty, high_sim_frac, symmetry
 
+
 def edge_density_score(cv2_gray):
     g = cv2_gray.astype(np.uint8)
     v = np.median(g)
@@ -201,6 +207,7 @@ def edge_density_score(cv2_gray):
     density = float(np.sum(edges>0) / (edges.size + 1e-9))
     score = (density - 0.001) / (0.04 - 0.001)
     return clamp01(score), density
+
 
 def color_hist_kurtosis_score(cv2_bgr):
     chans = cv2.split(cv2_bgr)
@@ -225,6 +232,7 @@ def color_hist_kurtosis_score(cv2_bgr):
         score = 0.25
     return clamp01(score), mean_k
 
+
 def entropy_score(cv2_gray):
     hist = cv2.calcHist([cv2_gray.astype(np.uint8)], [0], None, [256], [0,256]).flatten()
     p = hist / (hist.sum()+1e-9)
@@ -232,6 +240,7 @@ def entropy_score(cv2_gray):
     ent = float(-np.sum(p * np.log2(p)))
     score = (ent - 3.0) / (7.0 - 3.0)
     return clamp01(score), ent
+
 
 def jpeg_quality_hint(pil_img):
     try:
@@ -304,7 +313,7 @@ def cleanup_old_files():
 threading.Thread(target=cleanup_old_files, daemon=True).start()
 
 # -------------------------
-# Beautiful UI template (Jinja)
+# Beautiful LIGHT UI template (Jinja)
 # -------------------------
 INDEX_HTML = """
 <!doctype html>
@@ -317,33 +326,37 @@ INDEX_HTML = """
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root{
-      --bg1: #041025;
-      --bg2: #07172b;
-      --card: rgba(255,255,255,0.03);
-      --accent1: #7c3aed;
-      --accent2: #06b6d4;
+      --bg1: #f8fafc; /* soft sky */
+      --bg2: #ffffff; /* paper */
+      --card: rgba(15,23,42,0.03);
+      --accent1: #7c3aed; /* purple */
+      --accent2: #06b6d4; /* teal */
+      --accent3: #f59e0b; /* warm */
       --good: #10b981;
       --warn: #f59e0b;
       --bad: #ef4444;
+      --text: #0f172a;
+      --muted: #475569;
     }
     html,body{ height:100% }
-    body{ background: radial-gradient(1200px 600px at 10% 10%, rgba(124,58,237,0.06), transparent 10%), linear-gradient(135deg,var(--bg1),var(--bg2)); color:#e6eef8; font-family: 'Inter', system-ui, -apple-system, Roboto, Arial; }
+    body{ background: radial-gradient(800px 300px at 10% 8%, rgba(124,58,237,0.06), transparent 6%), linear-gradient(180deg,var(--bg1),var(--bg2)); color:var(--text); font-family: 'Inter', system-ui, -apple-system, Roboto, Arial; }
     .container{ max-width:1100px; padding:36px 18px; }
     .brand{ font-weight:800; font-size:1.2rem; letter-spacing:-0.4px; display:flex; gap:8px; align-items:center; }
-    .logo-dot{ width:12px; height:12px; border-radius:50%; background:linear-gradient(45deg,var(--accent1),var(--accent2)); box-shadow:0 6px 18px rgba(124,58,237,0.16) }
-    .card.glass{ background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border:1px solid rgba(255,255,255,0.03); box-shadow: 0 12px 40px rgba(2,6,23,0.6); border-radius:14px; }
-    .upload-area{ border:2px dashed rgba(255,255,255,0.04); padding:28px; border-radius:12px; text-align:center; transition:all .14s ease; background:rgba(255,255,255,0.008) }
-    .upload-area.dragover{ transform: translateY(-6px); box-shadow:0 20px 60px rgba(2,6,23,0.7); border-color: rgba(124,58,237,0.9) }
-    .meter { --size:140px; width:var(--size); height:var(--size); border-radius:999px; display:grid; place-items:center; background: conic-gradient(var(--col, #06b6d4) var(--pct), rgba(255,255,255,0.04) 0); position:relative }
-    .meter .val{ font-weight:800; font-size:20px; color:#fff; text-shadow:0 2px 8px rgba(0,0,0,0.6) }
-    .layer{ border-left:4px solid rgba(255,255,255,0.03); padding-left:12px; margin-bottom:10px; border-radius:6px; padding-top:8px; padding-bottom:8px }
-    .score-pill{ padding:6px 10px; border-radius:999px; background: rgba(255,255,255,0.03); color:#eaf5ff; font-weight:700; min-width:64px; text-align:center }
-    .bar { height:10px; border-radius:999px; background: rgba(255,255,255,0.03); overflow:hidden; }
-    .bar > i { display:block; height:100%; border-radius:999px; width:0%; background:linear-gradient(90deg,var(--accent1),var(--accent2)); box-shadow:0 4px 18px rgba(7,16,36,0.6) }
-    .muted{ color:#9fb0d6 }
-    .small-muted{ color:#9fb0d6; font-size:0.95rem }
-    footer{ color:#9fb0d6; margin-top:24px; text-align:center; font-size:0.9rem }
-    .img-preview{ max-width:220px; border-radius:12px; border:1px solid rgba(255,255,255,0.04); box-shadow: 0 8px 40px rgba(2,6,23,0.5); }
+    .logo-dot{ width:12px; height:12px; border-radius:50%; background:linear-gradient(45deg,var(--accent1),var(--accent2)); box-shadow:0 8px 22px rgba(124,58,237,0.12) }
+    .card.glass{ background: linear-gradient(180deg, rgba(255,255,255,0.9), rgba(250,250,250,0.8)); border:1px solid rgba(15,23,42,0.04); box-shadow: 0 8px 30px rgba(15,23,42,0.06); border-radius:14px; }
+    .upload-area{ border:2px dashed rgba(15,23,42,0.06); padding:28px; border-radius:12px; text-align:center; transition:all .14s ease; background:linear-gradient(180deg, rgba(255,255,255,0.6), rgba(255,255,255,0.4)); }
+    .upload-area.dragover{ transform: translateY(-6px); box-shadow:0 22px 60px rgba(7,16,36,0.06); border-color: rgba(124,58,237,0.9) }
+    .meter { --size:140px; width:var(--size); height:var(--size); border-radius:999px; display:grid; place-items:center; background: conic-gradient(var(--col, var(--accent2)) var(--pct), rgba(0,0,0,0.06) 0); position:relative; border:6px solid rgba(9,30,66,0.03) }
+    .meter .val{ font-weight:800; font-size:20px; color:var(--text); text-shadow:none }
+    .layer{ border-left:4px solid rgba(15,23,42,0.04); padding-left:12px; margin-bottom:10px; border-radius:6px; padding-top:8px; padding-bottom:8px }
+    .score-pill{ padding:6px 10px; border-radius:999px; background: linear-gradient(90deg, rgba(124,58,237,0.08), rgba(6,182,212,0.06)); color:var(--text); font-weight:700; min-width:64px; text-align:center }
+    .bar { height:10px; border-radius:999px; background: rgba(15,23,42,0.04); overflow:hidden; }
+    .bar > i { display:block; height:100%; border-radius:999px; width:0%; background:linear-gradient(90deg,var(--accent1),var(--accent2)); box-shadow:0 4px 12px rgba(7,16,36,0.06) }
+    .muted{ color:var(--muted) }
+    .small-muted{ color:var(--muted); font-size:0.95rem }
+    footer{ color:var(--muted); margin-top:24px; text-align:center; font-size:0.9rem }
+    .img-preview{ max-width:220px; border-radius:12px; border:1px solid rgba(15,23,42,0.04); box-shadow: 0 8px 30px rgba(15,23,42,0.04); }
+    .btn-accent{ background: linear-gradient(90deg,var(--accent1),var(--accent2)); border:none; color:white }
     @media (max-width:990px){ .meter{ --size:120px } .img-preview{ max-width:140px } }
   </style>
 </head>
@@ -360,8 +373,8 @@ INDEX_HTML = """
         <div class="small-muted">Explainable heuristics to flag likely AI-generated images — layered analysis & friendly UI.</div>
       </div>
       <div class="d-flex gap-2">
-        <a class="btn btn-sm btn-outline-light" href="/health">Health</a>
-        <a class="btn btn-sm btn-outline-light" href="/admin/exports?token={{ admin_token }}">Export</a>
+        <a class="btn btn-sm btn-outline-dark" href="/health">Health</a>
+        <a class="btn btn-sm btn-outline-dark" href="/admin/exports?token={{ admin_token }}">Export</a>
       </div>
     </div>
 
@@ -369,7 +382,7 @@ INDEX_HTML = """
       <div class="row g-3">
         <div class="col-lg-7">
           <div id="uploadArea" class="upload-area">
-            <svg width="56" height="56" viewBox="0 0 24 24" fill="none"><path d="M12 3v10" stroke="#9fb0d6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" stroke="#9fb0d6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <svg width="56" height="56" viewBox="0 0 24 24" fill="none"><path d="M12 3v10" stroke="#475569" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" stroke="#475569" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
             <h4 class="mt-2">Drag & drop or click to upload</h4>
             <div class="muted">PNG / JPG / WebP / BMP — up to <strong>{{ mb }} MB</strong></div>
             <div class="small-muted mt-2">We run EXIF, sensor residuals, texture & frequency analyses, edge & color checks, and more.</div>
@@ -383,8 +396,8 @@ INDEX_HTML = """
                 <div id="previewName" class="fw-semibold"></div>
                 <div id="previewSize" class="small-muted mb-2"></div>
                 <div>
-                  <button id="analyzeBtn" class="btn btn-primary" style="background:linear-gradient(90deg,var(--accent1),var(--accent2)); border:none">Analyze</button>
-                  <button id="clearBtn" class="btn btn-outline-light ms-2">Clear</button>
+                  <button id="analyzeBtn" class="btn btn-accent">Analyze</button>
+                  <button id="clearBtn" class="btn btn-outline-secondary ms-2">Clear</button>
                 </div>
               </div>
             </div>
@@ -399,7 +412,7 @@ INDEX_HTML = """
         <div class="col-lg-5">
           <div id="resultCard" class="card p-3 text-center d-none">
             <div class="d-flex flex-column align-items-center">
-              <div class="meter mb-2" id="meter" style="--pct:0deg; --col:#06b6d4;"><div class="val" id="meterVal">--</div></div>
+              <div class="meter mb-2" id="meter" style="--pct:0deg; --col:var(--accent2);"><div class="val" id="meterVal">--</div></div>
               <div id="resultLabel" class="h5">No result</div>
               <div id="resultSub" class="small-muted mb-2">Upload an image to begin</div>
             </div>
@@ -409,10 +422,10 @@ INDEX_HTML = """
               <div id="layers"></div>
             </div>
             <div class="mt-3 d-flex justify-content-between">
-              <a id="downloadReport" class="btn btn-sm btn-outline-light">Download report</a>
+              <a id="downloadReport" class="btn btn-sm btn-outline-dark">Download report</a>
               <div>
-                <button id="copyScore" class="btn btn-sm btn-outline-light me-2">Copy score</button>
-                <a id="recheckBtn" class="btn btn-sm btn-outline-light">Analyze another</a>
+                <button id="copyScore" class="btn btn-sm btn-outline-dark me-2">Copy score</button>
+                <a id="recheckBtn" class="btn btn-sm btn-outline-dark">Analyze another</a>
               </div>
             </div>
           </div>
@@ -509,8 +522,8 @@ INDEX_HTML = """
       const score = Math.max(0, Math.min(100, Math.round((d.realness_score||0)*10)/10));
       const angle = (score/100)*360 + 'deg';
       meter.style.setProperty('--pct', angle);
-      let color = '#06b6d4';
-      if(score >= 70) color = '#10b981'; else if(score >= 40) color = '#f59e0b'; else color = '#ef4444';
+      let color = 'var(--accent2)';
+      if(score >= 70) color = 'var(--good)'; else if(score >= 40) color = 'var(--warn)'; else color = 'var(--bad)';
       meter.style.setProperty('--col', color);
       meterVal.textContent = score;
       resultLabel.textContent = d.label || (score>=70 ? 'Likely REAL' : (score>=40 ? 'Unsure / Possibly Real' : 'Likely AI / Synthetic'));
