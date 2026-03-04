@@ -11,3 +11,4 @@ python-dotenv
 sqlalchemy
 flask_sqlalchemy
 flask-talisman
+onnxruntime      # optional, only if using ONNX ML model
