@@ -1,4 +1,4 @@
-# app.py -- Dark Horse Image Truth Engine (final, UI + layered analysis, Render-friendly)
+# app.py -- Dark Horse Image Truth Engine (final UI + layered analysis, render-friendly)
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -8,6 +8,7 @@ import threading
 from datetime import datetime, timedelta
 from io import BytesIO
 import math
+import json
 
 from flask import (
     Flask, request, jsonify, render_template_string,
@@ -19,7 +20,7 @@ from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
 from werkzeug.utils import secure_filename
 
-from PIL import Image, ExifTags
+from PIL import Image, ExifTags, ImageOps
 import piexif
 import numpy as np
 import cv2
@@ -36,15 +37,13 @@ MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE_BYTES", 10 * 1024 * 1024))  # 
 ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
 RATE_LIMIT_MAX = int(os.environ.get("RATE_LIMIT_MAX", 100))
 MAX_FILE_AGE_DAYS = int(os.environ.get("MAX_FILE_AGE_DAYS", 30))
-# By default use /tmp on cloud to avoid ephemeral-rewrite surprises; override locally if needed
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/tmp/uploads" if os.environ.get("RENDER", "") else "uploads")
-
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # -------------------------
 # App + DB + Security
 # -------------------------
-app = Flask(__name__)
+app = Flask(__name__, static_folder=None)
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
@@ -81,34 +80,40 @@ with app.app_context():
 def extract_exif(pil_img):
     """Return flattened EXIF dict or {}"""
     try:
-        exif_dict = piexif.load(pil_img.info.get('exif', b''))
-        out = {}
-        for ifd in exif_dict:
-            try:
-                for k, v in exif_dict[ifd].items():
-                    try:
-                        if isinstance(v, bytes):
-                            v = v.decode(errors='ignore')
-                    except Exception:
-                        pass
-                    out[f"{ifd}:{k}"] = v
-            except Exception:
-                pass
-        return out
+        raw_exif = pil_img.info.get('exif', b'')
+        if raw_exif:
+            exif_dict = piexif.load(raw_exif)
+            out = {}
+            for ifd in exif_dict:
+                try:
+                    for k, v in exif_dict[ifd].items():
+                        try:
+                            if isinstance(v, bytes):
+                                v = v.decode(errors='ignore')
+                        except Exception:
+                            pass
+                        out[f"{ifd}:{k}"] = v
+                except Exception:
+                    pass
+            return out
     except Exception:
-        try:
-            raw = pil_img._getexif() or {}
-            readable = {}
-            for k, v in raw.items():
-                name = ExifTags.TAGS.get(k, k)
-                readable[name] = v
-            return readable
-        except Exception:
-            return {}
+        pass
+
+    # Fallback to PIL _getexif
+    try:
+        raw = getattr(pil_img, "_getexif", lambda: {})() or {}
+        readable = {}
+        for k, v in raw.items():
+            name = ExifTags.TAGS.get(k, k)
+            readable[name] = v
+        return readable
+    except Exception:
+        return {}
 
 def pil_to_cv2(pil_img):
     arr = np.array(pil_img.convert('RGB'))
-    return arr[:, :, ::-1].copy()  # RGB->BGR
+    # Return BGR (cv2 default)
+    return arr[:, :, ::-1].copy()
 
 def clamp01(x):
     return max(0.0, min(1.0, float(x)))
@@ -117,12 +122,10 @@ def clamp01(x):
 # Analysis signals (layered)
 # -------------------------
 def sensor_noise_score(cv2_gray):
-    # High-pass residual STD normalized heuristically
     img = cv2_gray.astype(np.float32) / 255.0
     blurred = cv2.GaussianBlur(img, (5,5), 0)
     residual = img - blurred
     std = float(np.std(residual))
-    # Normalize: typical real ~0.005-0.03
     score = (std - 0.002) / (0.04 - 0.002)
     return clamp01(score), std
 
@@ -149,7 +152,6 @@ def frequency_kurtosis_score(cv2_gray):
     mag = np.abs(fshift).flatten()
     log_mag = np.log1p(mag)
     k = float(kurtosis(log_mag, fisher=False, nan_policy='omit') or 0.0)
-    # Map to score: moderate kurtosis -> high score, extreme low/high -> lower
     if math.isnan(k):
         k = 0.0
     if k <= 2:
@@ -191,28 +193,21 @@ def artifact_penalty(cv2_bgr):
     return penalty, high_sim_frac, symmetry
 
 def edge_density_score(cv2_gray):
-    # Canny edges ratio
     g = cv2_gray.astype(np.uint8)
-    # adaptive thresholds based on median
     v = np.median(g)
     lower = int(max(0, 0.66 * v))
     upper = int(min(255, 1.33 * v))
     edges = cv2.Canny(g, lower, upper)
     density = float(np.sum(edges>0) / (edges.size + 1e-9))
-    # Real photos often have natural edge density; overly-smooth AI images may have lower density
-    # Map expected from 0..0.05 roughly
     score = (density - 0.001) / (0.04 - 0.001)
     return clamp01(score), density
 
 def color_hist_kurtosis_score(cv2_bgr):
-    # compute histogram kurtosis across channels; synthetic images sometimes have spiky color histograms
     chans = cv2.split(cv2_bgr)
     ks = []
     for c in chans:
         hist = cv2.calcHist([c], [0], None, [256], [0,256]).flatten()
-        # normalize and log
         hist = hist / (hist.sum()+1e-9)
-        # avoid degenerate
         log_hist = np.log1p(hist)
         try:
             k = float(kurtosis(log_hist, fisher=False, nan_policy='omit'))
@@ -220,7 +215,6 @@ def color_hist_kurtosis_score(cv2_bgr):
             k = 0.0
         ks.append(k if not math.isnan(k) else 0.0)
     mean_k = float(np.mean(ks))
-    # moderate mean kurtosis ~ 2-8 => natural. map similarly
     if mean_k <= 2:
         score = 0.3
     elif mean_k <= 10:
@@ -232,28 +226,24 @@ def color_hist_kurtosis_score(cv2_bgr):
     return clamp01(score), mean_k
 
 def entropy_score(cv2_gray):
-    # Shannon entropy of grayscale image
     hist = cv2.calcHist([cv2_gray.astype(np.uint8)], [0], None, [256], [0,256]).flatten()
     p = hist / (hist.sum()+1e-9)
     p = p[p>0]
     ent = float(-np.sum(p * np.log2(p)))
-    # map typical entropy 3..7 for natural images -> score
     score = (ent - 3.0) / (7.0 - 3.0)
     return clamp01(score), ent
 
 def jpeg_quality_hint(pil_img):
-    # Best-effort: if quantization tables are available, estimate relative quality.
     try:
-        qtables = pil_img.quantization  # dict of quant tables when PIL opened as JPEG
-        # simple heuristic: average quant value -> lower quant (higher numbers) signals higher compression / lower quality.
+        qtables = getattr(pil_img, 'quantization', None)
+        if not qtables:
+            return None, None
         vals = []
         for k,v in qtables.items():
             vals.extend(v)
         mean_q = float(np.mean(vals)) if vals else None
-        # map: smaller mean_q -> better quality. We'll invert & normalize roughly
         if mean_q is None:
             return None, None
-        # heuristics: mean 1..200 range. map to score
         score = 1.0 - (mean_q / 200.0)
         return clamp01(score), mean_q
     except Exception:
@@ -263,11 +253,6 @@ def jpeg_quality_hint(pil_img):
 # Combine signals -> final score
 # -------------------------
 def compute_final_realness(signals):
-    """
-    signals: dict of individual metric scores (all 0..1 when present), and penalties (0..1)
-    Weighted linear combination, tuned heuristically.
-    """
-    # Default weights (tweakable)
     weights = {
         'exif': 0.12,
         'sensor': 0.25,
@@ -277,7 +262,6 @@ def compute_final_realness(signals):
         'color': 0.08,
         'entropy': 0.07,
     }
-    # collect present values
     total_w = 0.0
     acc = 0.0
     for k,w in weights.items():
@@ -288,9 +272,7 @@ def compute_final_realness(signals):
         base = 0.5
     else:
         base = acc / total_w
-    # penalties (artifact penalty, artifact symmetry etc.)
-    penalty = signals.get('artifact_penalty', 0.0)  # 0..1
-    # apply penalty multiplicatively (reduce confidence)
+    penalty = signals.get('artifact_penalty', 0.0)
     raw = base * (1.0 - 0.6 * penalty)
     return float(np.clip(raw, 0.0, 1.0))
 
@@ -335,35 +317,49 @@ INDEX_HTML = """
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root{
-      --bg: linear-gradient(135deg,#071024 0%,#07172b 100%);
+      --bg1: #041025;
+      --bg2: #07172b;
       --card: rgba(255,255,255,0.03);
       --accent1: #7c3aed;
       --accent2: #06b6d4;
+      --good: #10b981;
+      --warn: #f59e0b;
+      --bad: #ef4444;
     }
-    body{ background: var(--bg); color:#e6eef8; font-family: 'Inter', system-ui, -apple-system, Roboto, Arial; }
+    html,body{ height:100% }
+    body{ background: radial-gradient(1200px 600px at 10% 10%, rgba(124,58,237,0.06), transparent 10%), linear-gradient(135deg,var(--bg1),var(--bg2)); color:#e6eef8; font-family: 'Inter', system-ui, -apple-system, Roboto, Arial; }
     .container{ max-width:1100px; padding:36px 18px; }
-    .card.glass{ background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border:1px solid rgba(255,255,255,0.03); box-shadow: 0 8px 30px rgba(0,0,0,0.6); }
-    .brand{ font-weight:800; font-size:1.3rem; letter-spacing:-0.4px; }
-    .muted{ color:#9fb0d6 }
+    .brand{ font-weight:800; font-size:1.2rem; letter-spacing:-0.4px; display:flex; gap:8px; align-items:center; }
+    .logo-dot{ width:12px; height:12px; border-radius:50%; background:linear-gradient(45deg,var(--accent1),var(--accent2)); box-shadow:0 6px 18px rgba(124,58,237,0.16) }
+    .card.glass{ background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border:1px solid rgba(255,255,255,0.03); box-shadow: 0 12px 40px rgba(2,6,23,0.6); border-radius:14px; }
     .upload-area{ border:2px dashed rgba(255,255,255,0.04); padding:28px; border-radius:12px; text-align:center; transition:all .14s ease; background:rgba(255,255,255,0.008) }
-    .upload-area.dragover{ transform: translateY(-6px); box-shadow:0 12px 40px rgba(2,6,23,0.6); border-color: rgba(124,58,237,0.7) }
-    .meter { --size:120px; width:var(--size); height:var(--size); border-radius:999px; display:grid; place-items:center; background: conic-gradient(var(--col, #06b6d4) var(--pct), rgba(255,255,255,0.04) 0); }
-    .meter .val{ font-weight:700; font-size:20px; color:#fff }
-    .layer{ border-left:4px solid rgba(255,255,255,0.03); padding-left:12px; margin-bottom:10px }
-    .score-pill{ padding:6px 10px; border-radius:999px; background: rgba(255,255,255,0.03); color:#eaf5ff; font-weight:700 }
-    footer{ color:#9fb0d6; margin-top:24px; text-align:center; font-size:0.9rem }
+    .upload-area.dragover{ transform: translateY(-6px); box-shadow:0 20px 60px rgba(2,6,23,0.7); border-color: rgba(124,58,237,0.9) }
+    .meter { --size:140px; width:var(--size); height:var(--size); border-radius:999px; display:grid; place-items:center; background: conic-gradient(var(--col, #06b6d4) var(--pct), rgba(255,255,255,0.04) 0); position:relative }
+    .meter .val{ font-weight:800; font-size:20px; color:#fff; text-shadow:0 2px 8px rgba(0,0,0,0.6) }
+    .layer{ border-left:4px solid rgba(255,255,255,0.03); padding-left:12px; margin-bottom:10px; border-radius:6px; padding-top:8px; padding-bottom:8px }
+    .score-pill{ padding:6px 10px; border-radius:999px; background: rgba(255,255,255,0.03); color:#eaf5ff; font-weight:700; min-width:64px; text-align:center }
+    .bar { height:10px; border-radius:999px; background: rgba(255,255,255,0.03); overflow:hidden; }
+    .bar > i { display:block; height:100%; border-radius:999px; width:0%; background:linear-gradient(90deg,var(--accent1),var(--accent2)); box-shadow:0 4px 18px rgba(7,16,36,0.6) }
+    .muted{ color:#9fb0d6 }
     .small-muted{ color:#9fb0d6; font-size:0.95rem }
-    a.btn-export{ color:inherit; text-decoration:none }
+    footer{ color:#9fb0d6; margin-top:24px; text-align:center; font-size:0.9rem }
+    .img-preview{ max-width:220px; border-radius:12px; border:1px solid rgba(255,255,255,0.04); box-shadow: 0 8px 40px rgba(2,6,23,0.5); }
+    @media (max-width:990px){ .meter{ --size:120px } .img-preview{ max-width:140px } }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="d-flex justify-content-between align-items-center mb-3">
-      <div>
-        <div class="brand">Dark Horse <span class="muted">• Image Truth Engine</span></div>
-        <div class="small-muted">Layered, explainable heuristics to flag likely AI-generated images.</div>
+      <div class="d-flex flex-column">
+        <div class="brand">
+          <div class="logo-dot" aria-hidden></div>
+          <div>
+            Dark Horse <span class="muted">• Image Truth Engine</span>
+          </div>
+        </div>
+        <div class="small-muted">Explainable heuristics to flag likely AI-generated images — layered analysis & friendly UI.</div>
       </div>
-      <div>
+      <div class="d-flex gap-2">
         <a class="btn btn-sm btn-outline-light" href="/health">Health</a>
         <a class="btn btn-sm btn-outline-light" href="/admin/exports?token={{ admin_token }}">Export</a>
       </div>
@@ -375,14 +371,14 @@ INDEX_HTML = """
           <div id="uploadArea" class="upload-area">
             <svg width="56" height="56" viewBox="0 0 24 24" fill="none"><path d="M12 3v10" stroke="#9fb0d6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" stroke="#9fb0d6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
             <h4 class="mt-2">Drag & drop or click to upload</h4>
-            <div class="muted">PNG / JPG / WebP up to <strong>{{ mb }} MB</strong></div>
+            <div class="muted">PNG / JPG / WebP / BMP — up to <strong>{{ mb }} MB</strong></div>
             <div class="small-muted mt-2">We run EXIF, sensor residuals, texture & frequency analyses, edge & color checks, and more.</div>
             <input id="fileInput" type="file" accept="image/*" style="display:none;">
           </div>
 
           <div id="previewCard" class="mt-3 d-none card p-3">
             <div class="d-flex gap-3 align-items-start">
-              <img id="previewImage" class="img-preview" style="max-width:200px; border-radius:8px;"/>
+              <img id="previewImage" class="img-preview"/>
               <div class="flex-grow-1">
                 <div id="previewName" class="fw-semibold"></div>
                 <div id="previewSize" class="small-muted mb-2"></div>
@@ -414,7 +410,10 @@ INDEX_HTML = """
             </div>
             <div class="mt-3 d-flex justify-content-between">
               <a id="downloadReport" class="btn btn-sm btn-outline-light">Download report</a>
-              <a id="recheckBtn" class="btn btn-sm btn-outline-light">Analyze another</a>
+              <div>
+                <button id="copyScore" class="btn btn-sm btn-outline-light me-2">Copy score</button>
+                <a id="recheckBtn" class="btn btn-sm btn-outline-light">Analyze another</a>
+              </div>
             </div>
           </div>
 
@@ -451,6 +450,7 @@ INDEX_HTML = """
     const layers = document.getElementById('layers');
     const downloadReport = document.getElementById('downloadReport');
     const recheckBtn = document.getElementById('recheckBtn');
+    const copyScore = document.getElementById('copyScore');
 
     let currentFile = null;
     let lastReport = null;
@@ -507,14 +507,15 @@ INDEX_HTML = """
     function displayResult(d){
       resultCard.classList.remove('d-none');
       const score = Math.max(0, Math.min(100, Math.round((d.realness_score||0)*10)/10));
-      const angle = (score/100)*360;
-      const color = score>=70 ? 'linear-gradient(90deg,#16a34a,#06b6d4)' : (score>=40 ? 'linear-gradient(90deg,#f59e0b,#7c3aed)' : 'linear-gradient(90deg,#ef4444,#f97316)');
-      meter.style.setProperty('--pct', angle+'deg');
-      meter.style.setProperty('--col', '#06b6d4');
+      const angle = (score/100)*360 + 'deg';
+      meter.style.setProperty('--pct', angle);
+      let color = '#06b6d4';
+      if(score >= 70) color = '#10b981'; else if(score >= 40) color = '#f59e0b'; else color = '#ef4444';
+      meter.style.setProperty('--col', color);
       meterVal.textContent = score;
       resultLabel.textContent = d.label || (score>=70 ? 'Likely REAL' : (score>=40 ? 'Unsure / Possibly Real' : 'Likely AI / Synthetic'));
       resultSub.textContent = 'Confidence — higher means more likely a real camera capture';
-      // layers
+
       layers.innerHTML = '';
       const layerOrder = [
         ['exif','EXIF metadata','exif_found'],
@@ -530,18 +531,36 @@ INDEX_HTML = """
         if(d[field]===undefined) continue;
         const val = d[field];
         const scorev = (d.signals && d.signals[key]!==undefined) ? Math.round(d.signals[key]*100)/100 : null;
+        const barPct = scorev !== null ? Math.round((scorev)*100) : 0;
         const div = document.createElement('div');
         div.className = 'layer';
-        div.innerHTML = `<div class="d-flex justify-content-between align-items-center"><div><strong>${title}</strong><div class="small-muted">${field.replaceAll('_',' ')}</div></div><div class="score-pill">${(scorev!==null?scorev:'-')}</div></div><div class="small-muted mt-1">${Array.isArray(d.reasons)? '' : ''}</div>`;
+        div.innerHTML = `
+          <div class="d-flex justify-content-between align-items-center">
+            <div>
+              <strong>${title}</strong>
+              <div class="small-muted">${String(field).replaceAll('_',' ')}</div>
+            </div>
+            <div style="min-width:120px">
+              <div class="score-pill mb-1">${(scorev!==null?scorev:'-')}</div>
+              <div class="bar"><i style="width:${barPct}%;"></i></div>
+            </div>
+          </div>
+          <div class="small-muted mt-1">${Array.isArray(d.reasons)? '' : ''}</div>
+        `;
         layers.appendChild(div);
       }
-      // download report
+
       downloadReport.onclick = ()=> {
         if(!lastReport) return alert('No report');
         const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(lastReport, null, 2));
         const a = document.createElement('a'); a.setAttribute('href', dataStr); a.setAttribute('download', 'darkhorse_report_'+Date.now()+'.json'); document.body.appendChild(a); a.click(); a.remove();
       };
+
       recheckBtn.onclick = ()=>{ fileInput.value=''; currentFile=null; previewImage.src=''; previewCard.classList.add('d-none'); resultCard.classList.add('d-none'); layers.innerHTML=''; };
+      copyScore.onclick = ()=> {
+        if(!lastReport) return alert('No report');
+        navigator.clipboard.writeText('Dark Horse score: ' + (lastReport.realness_score || '')).then(()=> alert('Score copied to clipboard'));
+      };
     }
   </script>
 </body>
@@ -607,7 +626,13 @@ def detect():
     try:
         pil = Image.open(save_path)
         pil.verify()
+        # reopen to work with it
         pil = Image.open(save_path)
+        # fix orientation if necessary
+        try:
+            pil = ImageOps.exif_transpose(pil)
+        except Exception:
+            pass
     except Exception as e:
         try:
             os.remove(save_path)
@@ -620,6 +645,8 @@ def detect():
     exif_found = len(exif) > 0
 
     cv2_img = pil_to_cv2(pil)
+    if cv2_img is None or cv2_img.size == 0:
+        return jsonify({'error':'failed to decode image'}), 400
     gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
 
     # run signals
@@ -633,7 +660,6 @@ def detect():
     s_exif = 1.0 if exif_found else 0.0
     q_score, q_mean = jpeg_quality_hint(pil)
 
-    # assemble normalized signals dict for UI
     signals = {
         'exif': s_exif,
         'sensor': s_sensor,
@@ -649,7 +675,6 @@ def detect():
     final_raw = compute_final_realness(signals)
     final_score = float(round(final_raw * 100.0, 3))
 
-    # construct reasons (human readable)
     reasons = []
     if not exif_found:
         reasons.append("No camera EXIF metadata found — suspicious (many AI images miss EXIF).")
@@ -665,7 +690,7 @@ def detect():
     if q_score is not None:
         reasons.append(f"JPEG quantization mean: {q_mean:.2f} (quality hint score: {q_score:.2f})")
 
-    # DB log
+    # DB log (best-effort)
     try:
         row = Upload(filename=save_name, ip=request.remote_addr or 'unknown', realness_score=final_score, reasons="\n".join(reasons))
         db.session.add(row); db.session.commit()
@@ -696,7 +721,8 @@ def detect():
         'edge_density': edge_density,
         'color_hist_kurtosis': color_k,
         'entropy': ent,
-        'signals': signals
+        'signals': signals,
+        'exif_found': exif_found
     }
 
     is_ajax = request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.accept_mimetypes.best == 'application/json'
@@ -727,7 +753,7 @@ def admin_exports():
     return ("\n".join(lines), 200, {"Content-Type":"text/csv; charset=utf-8"})
 
 # -------------------------
-# Main (bind to PORT for Render)
+# Main (bind to PORT)
 # -------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
