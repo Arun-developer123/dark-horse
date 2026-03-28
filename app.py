@@ -905,6 +905,10 @@ def detect():
     exif = extract_exif(pil)
     exif_found = len(exif) > 0
 
+    # This is the special EXIF gate requested:
+    # value 1 = strong real-camera bias, value 0 = normal/default behavior.
+    exif_metadata_value = 1 if exif_found else 0
+
     cv2_img = pil_to_cv2(pil)
     if cv2_img is None or cv2_img.size == 0:
         return jsonify({'error': 'failed to decode image'}), 400
@@ -945,6 +949,10 @@ def detect():
 
     final_raw = compute_final_realness(signals)
 
+    # EXIF value 1 => strongly bias to REAL, but do not disturb other signals.
+    if exif_metadata_value == 1:
+        final_raw = max(final_raw, 0.88)
+
     # Additional strong penalty when no EXIF AND portrait-like face/eye issues exist.
     if not exif_found:
         final_raw *= 0.83
@@ -958,10 +966,14 @@ def detect():
     # Build numbered reasons in a deterministic order.
     reasons = []
     n = 1
-    if not exif_found:
-        reasons.append(f"{n}. No camera EXIF metadata found — suspicious for many real phone photos.")
+
+    # EXIF present/value 1 gets extra positive numbering
+    if exif_metadata_value == 1:
+        reasons.append(f"{n}. EXIF metadata value is 1 — strong real-camera signal.")
+        n += 1
+        reasons.append(f"{n}. Camera EXIF present — this pushes the image toward the real side more than the default path.")
     else:
-        reasons.append(f"{n}. Camera EXIF present — supports a camera capture signal, but EXIF can still be forged.")
+        reasons.append(f"{n}. No camera EXIF metadata found — suspicious for many real phone photos.")
     n += 1
 
     if eye.get('face_found'):
@@ -1004,7 +1016,10 @@ def detect():
         db.session.rollback()
 
     # label
-    if final_score >= 70:
+    if exif_metadata_value == 1:
+        label = "Likely REAL"
+        final_score = max(final_score, 88.0)
+    elif final_score >= 70:
         label = "Likely REAL"
     elif final_score >= 40:
         label = "Unsure / Possibly Real"
@@ -1029,6 +1044,7 @@ def detect():
         'entropy': ent,
         'signals': signals,
         'exif_found': exif_found,
+        'exif_metadata_value': exif_metadata_value,
         'face_found': eye.get('face_found', False),
         'face_count': eye.get('face_count', 0),
         'eyes_found': eye.get('eyes_found', 0),
