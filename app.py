@@ -128,6 +128,21 @@ def normalize_pair_diff(a, b, floor=1e-6):
     return abs(a - b) / (max(abs(a), abs(b), floor))
 
 
+def symmetry_difference(gray):
+    """0 = very symmetric, 1 = very asymmetric"""
+    if gray is None or gray.size == 0:
+        return 0.5
+    h, w = gray.shape[:2]
+    half = w // 2
+    if half < 2:
+        return 0.5
+    left = gray[:, :half].astype(np.float32)
+    right = gray[:, w - half:w].astype(np.float32)
+    right = np.fliplr(right)
+    diff = float(np.mean(np.abs(left - right)) / 255.0)
+    return clamp01(diff)
+
+
 # -------------------------
 # Analysis signals (layered)
 # -------------------------
@@ -294,8 +309,6 @@ def face_and_eye_analysis(cv2_bgr):
         }
 
         if face_count == 0:
-            # No face detected: not automatically AI, but if a portrait-like image has no eyes/faces,
-            # the model should strongly flag it as suspicious.
             return {
                 **best,
                 'face_found': False,
@@ -366,19 +379,252 @@ def face_and_eye_analysis(cv2_bgr):
         }
 
 
+def gan_fingerprint_score(cv2_gray):
+    """Heuristic GAN / diffusion fingerprint layer based on frequency spikes and periodic residuals."""
+    img = cv2_gray.astype(np.float32)
+    h, w = img.shape
+    target = 512
+    scale = max(1, int(max(h, w) / target))
+    if scale > 1:
+        img = cv2.resize(img, (max(1, w // scale), max(1, h // scale)), interpolation=cv2.INTER_AREA)
+    f = fftpack.fft2(img)
+    fshift = fftpack.fftshift(f)
+    mag = np.log1p(np.abs(fshift))
+    hh, ww = mag.shape
+    yy, xx = np.indices((hh, ww))
+    cy = (hh - 1) / 2.0
+    cx = (ww - 1) / 2.0
+    rr = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    rr_i = np.floor(rr).astype(np.int32)
+    max_r = int(rr_i.max()) + 1
+    radial_sum = np.bincount(rr_i.ravel(), weights=mag.ravel(), minlength=max_r)
+    radial_cnt = np.bincount(rr_i.ravel(), minlength=max_r)
+    radial = radial_sum / np.maximum(radial_cnt, 1)
+    radial = radial[1:] if len(radial) > 1 else radial
+    if len(radial) < 8:
+        return 0.5, {'peakiness': 0.0, 'highfreq_ratio': 0.5, 'spike_density': 0.0}
+    kernel_size = max(5, min(21, (len(radial) // 25) | 1))
+    kernel = np.ones(kernel_size, dtype=np.float32) / kernel_size
+    smooth = np.convolve(radial, kernel, mode='same')
+    resid = radial - smooth
+    peakiness = float(np.std(resid) / (np.mean(radial) + 1e-9))
+    thr = float(np.mean(resid) + 1.0 * np.std(resid))
+    peaks = 0
+    for i in range(1, len(resid) - 1):
+        if resid[i] > resid[i - 1] and resid[i] > resid[i + 1] and resid[i] > thr:
+            peaks += 1
+    spike_density = float(peaks / max(len(resid), 1))
+    hi_start = int(len(radial) * 0.7)
+    highfreq_ratio = float(np.sum(radial[hi_start:]) / (np.sum(radial) + 1e-9))
+
+    suspicious = 0.0
+    suspicious += 0.55 * clamp01((peakiness - 0.08) / 0.22)
+    suspicious += 0.30 * clamp01((highfreq_ratio - 0.34) / 0.22)
+    suspicious += 0.15 * clamp01(spike_density / 0.08)
+    suspicious = clamp01(suspicious)
+    realness = 1.0 - suspicious
+    return clamp01(realness), {
+        'peakiness': peakiness,
+        'highfreq_ratio': highfreq_ratio,
+        'spike_density': spike_density,
+        'suspicion': suspicious,
+    }
+
+
+def lighting_physics_score(cv2_bgr, eye_info=None):
+    """Estimate whether illumination and shadow direction look physically coherent."""
+    gray = cv2.cvtColor(cv2_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    h, w = gray.shape
+    if h < 2 or w < 2:
+        return 0.5, {'lr_imbalance': 0.0, 'tb_imbalance': 0.0, 'coherence': 0.0, 'contradiction': 0.0, 'suspicion': 0.5}
+
+    left = float(np.mean(gray[:, : w // 2]))
+    right = float(np.mean(gray[:, w // 2 :]))
+    top = float(np.mean(gray[: h // 2, :]))
+    bottom = float(np.mean(gray[h // 2 :, :]))
+    lr_imbalance = abs(left - right) / 255.0
+    tb_imbalance = abs(top - bottom) / 255.0
+
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.sqrt(gx * gx + gy * gy)
+    total_mag = float(np.sum(mag) + 1e-9)
+    angles = np.arctan2(gy, gx)
+    cos_mean = float(np.sum(np.cos(angles) * mag) / total_mag)
+    sin_mean = float(np.sum(np.sin(angles) * mag) / total_mag)
+    coherence = float(np.sqrt(cos_mean * cos_mean + sin_mean * sin_mean))
+
+    contradiction = 0.0
+    face_lr_imbalance = 0.0
+    if eye_info and eye_info.get('face_found') and eye_info.get('face_bbox'):
+        x, y, fw, fh = [int(v) for v in eye_info['face_bbox']]
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(w, x + fw), min(h, y + fh)
+        roi = gray[y1:y2, x1:x2]
+        if roi.size > 0 and roi.shape[1] >= 4:
+            mid = roi.shape[1] // 2
+            l = float(np.mean(roi[:, :mid]))
+            r = float(np.mean(roi[:, mid:]))
+            face_lr_imbalance = abs(l - r) / 255.0
+            if face_lr_imbalance > 0.03 and lr_imbalance > 0.03:
+                global_side = np.sign(left - right)
+                face_side = np.sign(l - r)
+                if global_side != 0 and face_side != 0 and global_side != face_side:
+                    contradiction = min(1.0, 0.5 + 0.5 * abs(face_lr_imbalance - lr_imbalance))
+            elif face_lr_imbalance > 0.06 and lr_imbalance < 0.02:
+                contradiction = 0.35
+
+    suspicious = 0.34 * lr_imbalance + 0.18 * tb_imbalance + 0.26 * (1.0 - coherence) + 0.22 * contradiction
+    suspicious = clamp01(suspicious)
+    realness = 1.0 - suspicious
+    return clamp01(realness), {
+        'lr_imbalance': lr_imbalance,
+        'tb_imbalance': tb_imbalance,
+        'coherence': coherence,
+        'contradiction': contradiction,
+        'face_lr_imbalance': face_lr_imbalance,
+        'suspicion': suspicious,
+    }
+
+
+def geometry_consistency_score(cv2_bgr, eye_info=None):
+    """Checks face ratio, symmetry, and eye alignment. This is a heuristic geometry layer."""
+    gray = cv2.cvtColor(cv2_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    if not eye_info or not eye_info.get('face_found') or not eye_info.get('face_bbox'):
+        # Neutral-ish when no face is present.
+        return 0.55, {
+            'aspect_ratio': None,
+            'face_symmetry': 0.5,
+            'eye_asymmetry': 0.5,
+            'eye_pair_score': 0.5,
+            'multiple_faces': int(eye_info.get('face_count', 0) - 1) if eye_info else 0,
+            'suspicion': 0.45,
+        }
+
+    x, y, fw, fh = [int(v) for v in eye_info['face_bbox']]
+    h, w = gray.shape
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(w, x + fw), min(h, y + fh)
+    roi = gray[y1:y2, x1:x2]
+    if roi.size == 0:
+        return 0.50, {
+            'aspect_ratio': None,
+            'face_symmetry': 0.5,
+            'eye_asymmetry': float(eye_info.get('eye_asymmetry', 0.0) or 0.0),
+            'eye_pair_score': float(eye_info.get('eye_pair_score', 0.0) or 0.0),
+            'multiple_faces': int(max(0, (eye_info.get('face_count', 0) or 0) - 1)),
+            'suspicion': 0.50,
+        }
+
+    aspect_ratio = float(fw / max(fh, 1))
+    aspect_dev = abs(np.log(max(aspect_ratio, 1e-3) / 0.95))
+    face_symmetry = symmetry_difference(roi)
+    eye_asymmetry = float(eye_info.get('eye_asymmetry', 0.0) or 0.0)
+    eye_pair_score = float(eye_info.get('eye_pair_score', 0.0) or 0.0)
+    eyes_found = int(eye_info.get('eyes_found', 0) or 0)
+    multiple_faces = int(max(0, (eye_info.get('face_count', 0) or 0) - 1))
+
+    suspicion = 0.0
+    suspicion += 0.22 * clamp01(aspect_dev / 0.6)
+    suspicion += 0.30 * clamp01(face_symmetry)
+    suspicion += 0.28 * clamp01(eye_asymmetry)
+    suspicion += 0.14 * clamp01(1.0 - eye_pair_score)
+    suspicion += 0.06 * clamp01(multiple_faces * 0.5)
+    if eyes_found < 2:
+        suspicion = clamp01(suspicion + 0.08)
+    else:
+        suspicion = clamp01(suspicion)
+
+    realness = 1.0 - suspicion
+    return clamp01(realness), {
+        'aspect_ratio': aspect_ratio,
+        'face_symmetry': face_symmetry,
+        'eye_asymmetry': eye_asymmetry,
+        'eye_pair_score': eye_pair_score,
+        'multiple_faces': multiple_faces,
+        'eyes_found': eyes_found,
+        'suspicion': suspicion,
+    }
+
+
+def compression_artifacts_score(cv2_gray, pil_img):
+    """Estimates blockiness / quantization artifacts."""
+    gray = cv2_gray.astype(np.float32)
+    h, w = gray.shape
+
+    def _boundary_score(arr, axis=1, step=8):
+        vals = []
+        if axis == 1:
+            for b in range(step, w, step):
+                vals.append(float(np.mean(np.abs(arr[:, b] - arr[:, b - 1]))))
+            baseline = float(np.mean(np.abs(arr[:, 1:] - arr[:, :-1]))) if w > 1 else 0.0
+        else:
+            for b in range(step, h, step):
+                vals.append(float(np.mean(np.abs(arr[b, :] - arr[b - 1, :]))))
+            baseline = float(np.mean(np.abs(arr[1:, :] - arr[:-1, :]))) if h > 1 else 0.0
+        boundary = float(np.mean(vals)) if vals else baseline
+        # Blockiness suspicion is how much stronger boundaries are than a normal 1-pixel difference baseline.
+        return clamp01(max(0.0, (boundary - baseline) / 255.0 * 6.0)), boundary, baseline
+
+    vb, v_boundary, v_base = _boundary_score(gray, axis=1)
+    hb, h_boundary, h_base = _boundary_score(gray, axis=0)
+    blockiness = clamp01((vb + hb) / 2.0)
+
+    q_score, q_mean = jpeg_quality_hint(pil_img)
+    if q_score is None:
+        q_score = 0.5
+
+    suspicion = clamp01(0.70 * blockiness + 0.30 * (1.0 - q_score))
+    realness = 1.0 - suspicion
+    return clamp01(realness), {
+        'blockiness': blockiness,
+        'vertical_boundary': v_boundary,
+        'vertical_baseline': v_base,
+        'horizontal_boundary': h_boundary,
+        'horizontal_baseline': h_base,
+        'q_score': q_score,
+        'q_mean': q_mean,
+        'suspicion': suspicion,
+    }
+
+
+def statistical_physical_consistency_score(score_values):
+    """Aggregate consistency across layers. High variance across signals usually means uncertainty."""
+    vals = [clamp01(float(v)) for v in score_values if v is not None]
+    if not vals:
+        return 0.5, {'mean': 0.5, 'std': 0.0, 'spread': 0.0, 'consistency': 0.5, 'suspicion': 0.5}
+    mean_v = float(np.mean(vals))
+    std_v = float(np.std(vals))
+    spread = float(np.max(vals) - np.min(vals))
+    consistency = 1.0 - clamp01(std_v * 2.2 + spread * 0.35)
+    realness = clamp01(0.72 * mean_v + 0.28 * consistency)
+    return realness, {
+        'mean': mean_v,
+        'std': std_v,
+        'spread': spread,
+        'consistency': consistency,
+        'suspicion': 1.0 - realness,
+    }
+
+
 # -------------------------
 # Combine signals -> final score
 # -------------------------
 def compute_final_realness(signals):
     weights = {
-        'exif': 0.10,
-        'sensor': 0.22,
-        'smooth': 0.15,
-        'freq': 0.13,
-        'edge': 0.09,
-        'color': 0.07,
-        'entropy': 0.06,
-        'eyes': 0.18,
+        'exif': 0.09,
+        'sensor': 0.10,
+        'smooth': 0.07,
+        'freq': 0.06,
+        'edge': 0.05,
+        'color': 0.04,
+        'entropy': 0.03,
+        'eyes': 0.10,
+        'gan': 0.12,
+        'lighting': 0.10,
+        'geometry': 0.10,
+        'compression': 0.08,
+        'statphys': 0.06,
     }
     total_w = 0.0
     acc = 0.0
@@ -565,7 +811,7 @@ INDEX_HTML = """
             Dark Horse <span class="muted">• Image Truth Engine</span>
           </div>
         </div>
-        <div class="small-muted">Explainable layered checks for AI-vs-real image suspicion, with portrait eye analysis and EXIF signals.</div>
+        <div class="small-muted">Explainable layered checks for AI-vs-real image suspicion, with portrait eye analysis, EXIF signals, and physics-based consistency layers.</div>
       </div>
       <div class="d-flex gap-2">
         <a class="btn btn-sm btn-outline-dark" href="/health">Health</a>
@@ -580,7 +826,7 @@ INDEX_HTML = """
             <svg width="56" height="56" viewBox="0 0 24 24" fill="none"><path d="M12 3v10" stroke="#475569" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" stroke="#475569" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
             <h4 class="mt-2">Drag & drop or click to upload</h4>
             <div class="muted">PNG / JPG / WebP / BMP — up to <strong>{{ mb }} MB</strong></div>
-            <div class="small-muted mt-2">Checks EXIF, sensor residuals, texture, frequency, edges, color, entropy, and face/eye consistency.</div>
+            <div class="small-muted mt-2">Checks EXIF, sensor residuals, texture, frequency, edges, color, entropy, face/eye consistency, GAN fingerprint patterns, lighting physics, geometry consistency, and compression artifacts.</div>
             <input id="fileInput" type="file" accept="image/*" style="display:none;">
           </div>
 
@@ -754,18 +1000,24 @@ INDEX_HTML = """
         ['smooth','Local texture variance','smoothness_meanvar'],
         ['freq','Frequency kurtosis','frequency_kurtosis'],
         ['eyes','Face / eye consistency','eye_mismatch_score'],
-        ['artifact','Artifact penalty','artifact_penalty'],
+        ['artifact_penalty','Artifact penalty','artifact_penalty'],
         ['edge','Edge density','edge_density'],
         ['color','Color histogram kurtosis','color_hist_kurtosis'],
-        ['entropy','Entropy','entropy']
+        ['entropy','Entropy','entropy'],
+        ['gan','GAN fingerprint','gan_peakiness'],
+        ['lighting','Lighting physics','lighting_imbalance'],
+        ['geometry','Geometry consistency','geometry_asymmetry'],
+        ['compression','Compression artifacts','compression_blockiness'],
+        ['statphys','Statistical / physical consistency','statphys_std'],
       ];
       let idx = 1;
-      for(const [key,title,field] of layerOrder){
-        if(d[field]===undefined) continue;
+      for(const [signalKey,title,field] of layerOrder){
+        if(d[field] === undefined) continue;
         const raw = d[field];
-        const scorev = (d.signals && d.signals[key]!==undefined) ? Math.round(d.signals[key]*100)/100 : null;
-        const barPct = scorev !== null ? Math.round(scorev*100) : 0;
-        const desc = buildDescription(key, d, raw);
+        let scorev = (d.signals && d.signals[signalKey] !== undefined) ? Number(d.signals[signalKey]) : null;
+        if(signalKey === 'artifact_penalty' && scorev !== null) scorev = 1 - scorev; // display as realness, not penalty
+        const barPct = scorev !== null ? Math.round(Math.max(0, Math.min(1, scorev)) * 100) : 0;
+        const desc = buildDescription(signalKey, d, raw);
         const div = document.createElement('div');
         div.className = 'layer';
         div.innerHTML = `
@@ -775,7 +1027,7 @@ INDEX_HTML = """
               <div class="small-muted">${desc}</div>
             </div>
             <div style="min-width:120px">
-              <div class="score-pill mb-1">${(scorev!==null?scorev:'-')}</div>
+              <div class="score-pill mb-1">${(scorev !== null ? scorev.toFixed(2) : '-')}</div>
               <div class="bar"><i style="width:${barPct}%;"></i></div>
             </div>
           </div>
@@ -813,10 +1065,25 @@ INDEX_HTML = """
       if(key === 'sensor') return 'Higher sensor residual detail usually looks more like a camera capture.';
       if(key === 'smooth') return 'Very smooth local texture can be a synthetic-image cue.';
       if(key === 'freq') return 'Frequency-domain shape can reveal over-smoothing or generated patterns.';
-      if(key === 'artifact') return 'Repeated or mirrored textures may indicate generation artifacts.';
+      if(key === 'artifact_penalty') return 'Repeated or mirrored textures may indicate generation artifacts.';
       if(key === 'edge') return 'Edge density helps compare structural detail against a natural-photo baseline.';
       if(key === 'color') return 'Color histogram shape is another weak cue used in the final blend.';
       if(key === 'entropy') return 'Entropy indicates how diverse the pixel distribution is across the image.';
+      if(key === 'gan'){
+        return `FFT profile: peakiness ${Number(d.gan_peakiness || 0).toFixed(3)}, high-frequency ratio ${Number(d.gan_highfreq_ratio || 0).toFixed(3)}. Periodic spikes can indicate model fingerprints.`;
+      }
+      if(key === 'lighting'){
+        return `Lighting balance: left-right ${Number(d.lighting_imbalance || 0).toFixed(3)}, top-bottom ${Number(d.lighting_tb_imbalance || 0).toFixed(3)}, coherence ${Number(d.lighting_coherence || 0).toFixed(3)}.`;
+      }
+      if(key === 'geometry'){
+        return `Face symmetry and eye alignment: face asymmetry ${Number(d.geometry_face_symmetry || 0).toFixed(3)}, eye asymmetry ${Number(d.geometry_eye_asymmetry || 0).toFixed(3)}.`;
+      }
+      if(key === 'compression'){
+        return `Blockiness ${Number(d.compression_blockiness || 0).toFixed(3)} and JPEG hint ${d.compression_qscore !== undefined ? Number(d.compression_qscore).toFixed(3) : 'n/a'}.`;
+      }
+      if(key === 'statphys'){
+        return `Layer agreement: mean ${Number(d.statphys_mean || 0).toFixed(3)}, std ${Number(d.statphys_std || 0).toFixed(3)}, spread ${Number(d.statphys_spread || 0).toFixed(3)}.`;
+      }
       return '';
     }
   </script>
@@ -926,6 +1193,24 @@ def detect():
     q_score, q_mean = jpeg_quality_hint(pil)
     eye = face_and_eye_analysis(cv2_img)
 
+    # Additional layers requested
+    s_gan, gan_meta = gan_fingerprint_score(gray)
+    s_lighting, lighting_meta = lighting_physics_score(cv2_img, eye)
+    s_geometry, geometry_meta = geometry_consistency_score(cv2_img, eye)
+    s_compression, compression_meta = compression_artifacts_score(gray, pil)
+
+    # Statistical and physical consistency aggregation layer
+    s_statphys, statphys_meta = statistical_physical_consistency_score([
+        s_sensor,
+        s_smooth,
+        s_freq,
+        s_gan,
+        s_lighting,
+        s_geometry,
+        s_compression,
+        s_edge,
+    ])
+
     # If EXIF is missing, strongly punish suspiciousness instead of letting it be neutral.
     # For genuine phone photos, missing EXIF is a strong negative signal.
     exif_signal = 1.0 if exif_found else 0.15
@@ -945,6 +1230,11 @@ def detect():
         'entropy': s_entropy,
         'jpeg_hint': q_score,
         'eyes': eyes_realness,
+        'gan': s_gan,
+        'lighting': s_lighting,
+        'geometry': s_geometry,
+        'compression': s_compression,
+        'statphys': s_statphys,
     }
 
     final_raw = compute_final_realness(signals)
@@ -993,6 +1283,16 @@ def detect():
     reasons.append(f"{n}. Local texture variance (mean): {mean_var:.6e}")
     n += 1
     reasons.append(f"{n}. Frequency kurtosis: {kurt:.3f}")
+    n += 1
+    reasons.append(f"{n}. GAN fingerprint peakiness: {gan_meta['peakiness']:.3f} | High-frequency ratio: {gan_meta['highfreq_ratio']:.3f} | Spike density: {gan_meta['spike_density']:.3f}")
+    n += 1
+    reasons.append(f"{n}. Lighting imbalance LR: {lighting_meta['lr_imbalance']:.3f} | TB: {lighting_meta['tb_imbalance']:.3f} | Coherence: {lighting_meta['coherence']:.3f} | Contradiction: {lighting_meta['contradiction']:.3f}")
+    n += 1
+    reasons.append(f"{n}. Geometry aspect ratio: {geometry_meta['aspect_ratio'] if geometry_meta['aspect_ratio'] is not None else 0:.3f} | Face symmetry: {geometry_meta['face_symmetry']:.3f} | Eye asymmetry: {geometry_meta['eye_asymmetry']:.3f}")
+    n += 1
+    reasons.append(f"{n}. Compression blockiness: {compression_meta['blockiness']:.3f} | JPEG hint: {compression_meta['q_score']:.3f} | qtable mean: {compression_meta['q_mean'] if compression_meta['q_mean'] is not None else 0:.2f}")
+    n += 1
+    reasons.append(f"{n}. Statistical / physical consistency: mean {statphys_meta['mean']:.3f} | std {statphys_meta['std']:.3f} | spread {statphys_meta['spread']:.3f}")
     n += 1
     reasons.append(f"{n}. Artifact penalty: {penalty:.3f} (high_sim_frac: {high_sim_frac:.3f}, symmetry: {symmetry:.3f})")
     n += 1
@@ -1052,6 +1352,24 @@ def detect():
         'eye_asymmetry': eye.get('eye_asymmetry', 0.0),
         'eye_mismatch_score': eye.get('eye_mismatch_score', 0.0),
         'face_bbox': eye.get('face_bbox', None),
+        'gan_peakiness': gan_meta.get('peakiness', 0.0),
+        'gan_highfreq_ratio': gan_meta.get('highfreq_ratio', 0.0),
+        'gan_spike_density': gan_meta.get('spike_density', 0.0),
+        'lighting_imbalance': lighting_meta.get('lr_imbalance', 0.0),
+        'lighting_tb_imbalance': lighting_meta.get('tb_imbalance', 0.0),
+        'lighting_coherence': lighting_meta.get('coherence', 0.0),
+        'lighting_contradiction': lighting_meta.get('contradiction', 0.0),
+        'geometry_aspect_ratio': geometry_meta.get('aspect_ratio', None),
+        'geometry_face_symmetry': geometry_meta.get('face_symmetry', 0.0),
+        'geometry_eye_asymmetry': geometry_meta.get('eye_asymmetry', 0.0),
+        'geometry_eye_pair_score': geometry_meta.get('eye_pair_score', 0.0),
+        'compression_blockiness': compression_meta.get('blockiness', 0.0),
+        'compression_qscore': compression_meta.get('q_score', 0.0),
+        'compression_qmean': compression_meta.get('q_mean', None),
+        'statphys_mean': statphys_meta.get('mean', 0.0),
+        'statphys_std': statphys_meta.get('std', 0.0),
+        'statphys_spread': statphys_meta.get('spread', 0.0),
+        'statphys_consistency': statphys_meta.get('consistency', 0.0),
     }
 
     is_ajax = request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.accept_mimetypes.best == 'application/json'
